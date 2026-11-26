@@ -24,7 +24,7 @@ from replies import (
     ABUSE, COMMAND, HANDOFF_CALLBACK, IDENTITY_REPLY, REVIEW_INSTRUCTIONS, REVIEW_RISK,
     ROUTE_INSTRUCTIONS, TASK_CHECK_INSTRUCTIONS, VOICE_INSTRUCTIONS, business_question,
     conversational_reply, draft_route, is_model_question, masculine_reply, model_label,
-    requires_refusal, strip_emoji, task_evidence,
+    requires_refusal, short_reply, strip_emoji, task_evidence,
 )
 from state import ManualChats, PendingTurn, Vocabulary
 
@@ -587,7 +587,13 @@ class SecretaryBot:
         if requires_refusal(text):
             await send_notice(self.scope_refusals, 45, SCOPE_REFUSAL)
             return
-        if ABUSE.search(text) or self.client is None:
+        if ABUSE.search(text):
+            return
+        immediate = short_reply(text)
+        if immediate:
+            await respond(immediate)
+            return
+        if self.client is None:
             return
 
         draft_input = text

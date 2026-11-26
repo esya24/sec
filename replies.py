@@ -113,6 +113,25 @@ def is_model_question(text):
     return any(MODEL_QUESTION.fullmatch(part) for part in question_parts(text))
 
 
+SHORT_REPLIES = {
+    "привет": "Привет!",
+    "приветик": "Привет!",
+    "здравствуй": "Привет!",
+    "здравствуйте": "Здравствуйте!",
+    "доброе утро": "Доброе утро!",
+    "добрый день": "Добрый день!",
+    "добрый вечер": "Добрый вечер!",
+    "спасибо": "Пожалуйста!",
+    "большое спасибо": "Пожалуйста!",
+    "спасибо большое": "Пожалуйста!",
+    "благодарю": "Пожалуйста!",
+}
+
+
+def short_reply(text):
+    return SHORT_REPLIES.get(text.casefold().rstrip(" !.…"))
+
+
 # Model instructions and response validation
 
 VOICE_INSTRUCTIONS = (
