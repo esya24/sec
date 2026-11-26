@@ -1,4 +1,4 @@
-from asyncio import Lock, Semaphore, create_task, current_task, gather, shield, sleep, timeout, to_thread
+from asyncio import Lock, Semaphore, create_task, current_task, gather, shield, timeout, to_thread
 import json
 import logging
 import os
@@ -75,6 +75,7 @@ class SecretaryBot:
         data_dir = os.environ.get("DATA_DIR", "/app/data")
         self.manual_chats = ManualChats(data_dir)
         self.vocabulary = Vocabulary(data_dir)
+        self.business_connections = {}
         self.connection_requests = {}
         self.handoff_requests = {}
         self.handoff_notices = OrderedDict()
@@ -375,7 +376,9 @@ class SecretaryBot:
         connection = update.business_connection
         if connection:
             self.connection_requests.pop(connection.id, None)
+            self.business_connections.pop(connection.id, None)
         if connection and connection.user.id == self.owner_id:
+            self.business_connections[connection.id] = connection
             for key in list(self.pending_turns):
                 self.discard_turn(key)
             ready = connection.is_enabled and connection.rights and connection.rights.can_reply
@@ -391,26 +394,27 @@ class SecretaryBot:
     async def eligible_connection(self, bot, connection_id):
         if not self.business_auto_reply or not connection_id:
             return None
-        request = self.connection_requests.get(connection_id)
-        if request is None:
-            request = create_task(self.fetch_connection(bot, connection_id))
-            self.connection_requests[connection_id] = request
-        connection, error = await shield(request)
-        if error is not None:
-            raise error
-        if (connection and connection.user.id == self.owner_id and connection.is_enabled
-                and connection.rights and connection.rights.can_reply):
+        connection = self.business_connections.get(connection_id)
+        if connection is None:
+            request = self.connection_requests.get(connection_id)
+            if request is None:
+                request = create_task(self.fetch_connection(bot, connection_id))
+                self.connection_requests[connection_id] = request
+            error = await shield(request)
+            connection = self.business_connections.get(connection_id)
+            if connection is None and error is not None:
+                raise error
+        if connection and connection.is_enabled and connection.rights and connection.rights.can_reply:
             return connection
         return None
 
     async def fetch_connection(self, bot, connection_id):
         try:
             connection = await bot.get_business_connection(connection_id)
-            if self.connection_requests.get(connection_id) is current_task():
-                return connection, None
-            return None, None
+            if self.connection_requests.get(connection_id) is current_task() and connection.user.id == self.owner_id:
+                self.business_connections[connection_id] = connection
         except TelegramError as error:
-            return None, error
+            return error
         finally:
             if self.connection_requests.get(connection_id) is current_task():
                 del self.connection_requests[connection_id]
@@ -498,12 +502,12 @@ class SecretaryBot:
                 return
             self.discard_turn(key)
             if await self.eligible_connection(context.bot, connection_id):
-                await self.manual_chats.record_async(message.chat, pause_from=message.date.timestamp())
+                self.manual_chats.record(message.chat, pause_from=message.date.timestamp())
             return
         if self.manual_chats.is_paused(message.chat.id):
             if (self.manual_chats.chat_name(message.chat) != self.manual_chats.names.get(message.chat.id)
                     and await self.eligible_connection(context.bot, connection_id)):
-                await self.manual_chats.record_async(message.chat)
+                self.manual_chats.record(message.chat)
             return
         text = (message.text or "").strip()
         if not text or len(text) > INPUT_LIMIT:
@@ -513,22 +517,18 @@ class SecretaryBot:
             return
         turn = self.pending_turns.get(key)
         if turn is not None:
-            turn.append(message, monotonic())
+            turn.append(message)
             return
         if len(self.pending_turns) >= MAX_BUSINESS_CHATS:
             return
         turn = PendingTurn()
-        turn.append(message, monotonic())
+        turn.append(message)
         self.pending_turns[key] = turn
         context.application.create_task(self.process_turns(context.bot, key, turn), update=update)
 
     async def process_turns(self, bot, key, turn):
         try:
             while self.pending_turns.get(key) is turn and turn.message is not None:
-                delay = turn.ready_at - monotonic()
-                if delay > 0:
-                    await sleep(delay)
-                    continue
                 revision = turn.revision
                 try:
                     await self.reply_to_turn(bot, key, turn, revision, turn.message)
@@ -646,43 +646,37 @@ class SecretaryBot:
             await respond("Не совсем понял. Ты про что?")
 
     async def ask_model(self, instructions, messages, *, max_tokens):
-        for attempt in range(2):
-            if monotonic() < self.model_retry_at:
-                return ""
-            started = monotonic()
-            try:
-                if self.chat_completions:
-                    response = await self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "system", "content": instructions}, *messages],
-                        max_tokens=max_tokens, store=False,
-                    )
-                    answer = response.choices[0].message.content if response.choices else None
-                else:
-                    response = await self.client.responses.create(
-                        model=self.model, instructions=instructions, input=messages,
-                        max_output_tokens=max_tokens, store=False,
-                    )
-                    answer = response.output_text
-            except OpenAIError as error:
-                status = getattr(error, "status_code", None)
-                LOGGER.warning(
-                    "Ошибка модели после %.2f с (%s, HTTP %s)",
-                    monotonic() - started, type(error).__name__, status or "—",
+        if monotonic() < self.model_retry_at:
+            return ""
+        started = monotonic()
+        try:
+            if self.chat_completions:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "system", "content": instructions}, *messages],
+                    max_tokens=max_tokens, store=False,
                 )
-                if status != 503:
-                    return ""
+                answer = response.choices[0].message.content if response.choices else None
+            else:
+                response = await self.client.responses.create(
+                    model=self.model, instructions=instructions, input=messages,
+                    max_output_tokens=max_tokens, store=False,
+                )
+                answer = response.output_text
+        except OpenAIError as error:
+            status = getattr(error, "status_code", None)
+            LOGGER.warning(
+                "Ошибка модели после %.2f с (%s, HTTP %s)",
+                monotonic() - started, type(error).__name__, status or "—",
+            )
+            if status == 503:
                 response = getattr(error, "response", None)
                 header = response.headers.get("Retry-After", "") if response is not None else ""
                 retry_after = int(header) if header.isascii() and header.isdecimal() and len(header) <= 9 else 0
-                if attempt or retry_after > 2:
-                    self.model_retry_at = max(self.model_retry_at, monotonic() + max(12, retry_after))
-                    return ""
-                await sleep(max(0.65, retry_after))
-                continue
-            LOGGER.info("Модель ответила за %.2f с.", monotonic() - started)
-            return (answer or "").strip()
-        return ""
+                self.model_retry_at = max(self.model_retry_at, monotonic() + max(0.65, retry_after))
+            return ""
+        LOGGER.info("Модель ответила за %.2f с.", monotonic() - started)
+        return (answer or "").strip()
 
 async def report_error(update, context):
     LOGGER.error("Ошибка при обработке обновления: %s", type(context.error).__name__)

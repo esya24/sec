@@ -17,24 +17,21 @@ from telegram import Message
 
 LOGGER = logging.getLogger(__name__)
 PAUSE_SECONDS = 30 * 60
-REPLY_DELAY = 0.3
 
 
 @dataclass(slots=True)
 class PendingTurn:
     message: Message | None = None
     revision: int = 0
-    ready_at: float = 0.0
     request: Task | None = None
     latest_message_id: int | None = None
 
-    def append(self, message, now):
+    def append(self, message):
         if self.latest_message_id is not None and self.latest_message_id >= message.message_id:
             return
         self.latest_message_id = message.message_id
         self.message = message
         self.revision += 1
-        self.ready_at = now + REPLY_DELAY
         self.cancel_request()
 
     def cancel_request(self):
