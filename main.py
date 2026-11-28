@@ -26,7 +26,7 @@ from replies import (
     conversational_reply, draft_route, is_model_question, masculine_reply, model_label,
     requires_refusal, short_reply, strip_emoji, task_evidence,
 )
-from state import ManualChats, PendingTurn, Vocabulary
+from state import Conversation, ManualChats, PendingTurn, Vocabulary
 
 LOGGER = logging.getLogger(__name__)
 INPUT_LIMIT = 4000
@@ -71,6 +71,7 @@ class SecretaryBot:
         self.business_auto_reply = business_auto_reply
         self.owner_updates = Lock()
         self.pending_turns = {}
+        self.conversations = OrderedDict()
         self.business_model_slots = Semaphore(4)
         data_dir = os.environ.get("DATA_DIR", "/app/data")
         self.manual_chats = ManualChats(data_dir)
@@ -379,7 +380,9 @@ class SecretaryBot:
             self.business_connections.pop(connection.id, None)
         if connection and connection.user.id == self.owner_id:
             self.business_connections[connection.id] = connection
-            for key in list(self.pending_turns):
+            for key in list(self.conversations.keys() | self.pending_turns.keys()):
+                if key[0] != connection.id:
+                    continue
                 self.discard_turn(key)
             ready = connection.is_enabled and connection.rights and connection.rights.can_reply
             LOGGER.info("Автоматизация чатов: %s", "ответы разрешены" if ready else "ответы выключены")
@@ -484,6 +487,7 @@ class SecretaryBot:
         await self.send_business(context.bot, message, answer)
 
     def discard_turn(self, key):
+        self.conversations.pop(key, None)
         turn = self.pending_turns.pop(key, None)
         if turn is not None:
             turn.cancel_request()
@@ -510,50 +514,58 @@ class SecretaryBot:
                 self.manual_chats.record(message.chat)
             return
         text = (message.text or "").strip()
-        if not text or len(text) > INPUT_LIMIT:
-            self.discard_turn(key)
-            return
-        if COMMAND.match(text):
+        if not text or len(text) > INPUT_LIMIT or COMMAND.match(text):
             return
         turn = self.pending_turns.get(key)
+        if turn is None and len(self.pending_turns) >= MAX_BUSINESS_CHATS:
+            return
+        conversation = turn.conversation if turn else self.conversations.get(key)
+        if conversation is None:
+            conversation = Conversation()
+        if not conversation.append(message, text):
+            return
+        self.conversations[key] = conversation
+        self.conversations.move_to_end(key)
+        if len(self.conversations) > MAX_BUSINESS_CHATS:
+            self.conversations.popitem(last=False)
         if turn is not None:
-            turn.append(message)
+            turn.message = message
             return
-        if len(self.pending_turns) >= MAX_BUSINESS_CHATS:
-            return
-        turn = PendingTurn()
-        turn.append(message)
+        turn = PendingTurn(conversation, message)
         self.pending_turns[key] = turn
         context.application.create_task(self.process_turns(context.bot, key, turn), update=update)
 
     async def process_turns(self, bot, key, turn):
         try:
-            while self.pending_turns.get(key) is turn and turn.message is not None:
-                revision = turn.revision
+            while self.pending_turns.get(key) is turn:
+                message = turn.message
                 try:
-                    await self.reply_to_turn(bot, key, turn, revision, turn.message)
+                    await self.reply_to_turn(bot, key, turn, message)
                 except TelegramError as error:
-                    if turn.revision == revision:
+                    if turn.message is message:
                         raise
-                    LOGGER.warning("Ошибка Telegram в заменённой реплике: %s", type(error).__name__)
-                if turn.revision == revision:
+                    LOGGER.warning("Ошибка Telegram при обработке реплик: %s", type(error).__name__)
+                if turn.message is message:
+                    turn.conversation.handled_message_id = message.message_id
                     return
         finally:
             if self.pending_turns.get(key) is turn:
                 self.pending_turns.pop(key)
 
-    async def reply_to_turn(self, bot, key, turn, revision, message):
-        text = message.text.strip()
+    async def reply_to_turn(self, bot, key, turn, message):
+        previous, new = turn.conversation.snapshot(message.date)
+        text = "\n".join(new)
+        model_input = {"предыдущие предложения": previous, "новые предложения": new}
         started = monotonic()
 
         def current():
-            return (self.pending_turns.get(key) is turn and turn.revision == revision
+            return (self.pending_turns.get(key) is turn and turn.message is message
                     and not self.manual_chats.is_paused(message.chat.id))
 
         async def respond(answer, **options):
             if not current():
                 return False
-            turn.message = None
+            turn.conversation.handled_message_id = message.message_id
             await self.send_business(bot, message, answer, **options)
             LOGGER.info("Автоответ отправлен за %.2f с после начала обработки.", monotonic() - started)
             return True
@@ -587,16 +599,16 @@ class SecretaryBot:
         if requires_refusal(text):
             await send_notice(self.scope_refusals, 45, SCOPE_REFUSAL)
             return
-        if ABUSE.search(text):
+        if any(ABUSE.search(sentence) for sentence in new):
             return
-        immediate = short_reply(text)
+        immediate = short_reply(text) if not previous else None
         if immediate:
             await respond(immediate)
             return
         if self.client is None:
             return
 
-        draft_input = text
+        draft_input = model_input.copy()
         if random() < VOCABULARY_CHANCE:
             try:
                 words = await to_thread(self.vocabulary.entries_if_present)
@@ -604,10 +616,8 @@ class SecretaryBot:
                 LOGGER.warning("Не удалось прочитать словарь: %s", type(error).__name__)
             else:
                 if words:
-                    draft_input = json.dumps(
-                        {"сообщение": text, "слово из словаря": choice(words)[1]}, ensure_ascii=False,
-                    )
-        current_message = [{"role": "user", "content": draft_input}]
+                    draft_input["слово из словаря"] = choice(words)[1]
+        current_message = [{"role": "user", "content": json.dumps(draft_input, ensure_ascii=False)}]
         async with self.business_model_slots:
             if not current():
                 return
@@ -625,7 +635,7 @@ class SecretaryBot:
                 raw_risk = REVIEW_RISK.search(answer)
                 visible_risk = not raw_risk and visible != answer and REVIEW_RISK.search(visible)
                 if mode == "REVIEW" or raw_risk or visible_risk:
-                    review = json.dumps({"сообщение": text, "предложенный ответ": visible if visible_risk else answer},
+                    review = json.dumps({**model_input, "предложенный ответ": visible if visible_risk else answer},
                                         ensure_ascii=False)
                     verdict = await turn.run_request(self.ask_model(
                         REVIEW_INSTRUCTIONS, [{"role": "user", "content": review}], max_tokens=16,
@@ -633,7 +643,7 @@ class SecretaryBot:
                 else:
                     verdict = "SEND"
             elif check_task:
-                evidence = json.dumps({"последнее сообщение": text, "цитата просьбы": candidate}, ensure_ascii=False)
+                evidence = json.dumps({"новые предложения": new, "цитата просьбы": candidate}, ensure_ascii=False)
                 verdict = await turn.run_request(self.ask_model(
                     TASK_CHECK_INSTRUCTIONS, [{"role": "user", "content": evidence}], max_tokens=16,
                 ))

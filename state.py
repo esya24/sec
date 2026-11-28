@@ -4,8 +4,10 @@ import logging
 import os
 import re
 import sqlite3
+from collections import deque
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import timedelta
 from math import isfinite
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -17,22 +19,60 @@ from telegram import Message
 
 LOGGER = logging.getLogger(__name__)
 PAUSE_SECONDS = 30 * 60
+SENTENCE_END = re.compile(r"""[.!?…]+[»”"')\]]*(?=\s|$)|\n+""")
+ABBREVIATION = re.compile(
+    r"(?i)\b(?:гг?|ул|дм|стр|рис|табл|руб|коп|им|см|т\.\s*[депкчн])$"
+)
+INITIAL = re.compile(r"\b[А-ЯЁA-Z]$")
+NAME_AFTER_INITIAL = re.compile(r"[^\S\n]*[А-ЯЁA-Z](?:[а-яёa-z]|\.)")
+
+
+def split_sentences(text):
+    start = 0
+    for match in SENTENCE_END.finditer(text):
+        if match[0] == ".":
+            if ABBREVIATION.search(text, start, match.start()):
+                continue
+            initial = INITIAL.search(text, start, match.start())
+            if initial and initial[0] not in {"Я", "I"} and NAME_AFTER_INITIAL.match(text, match.end()):
+                continue
+        sentence = text[start:match.end()].strip()
+        if sentence:
+            yield sentence
+        start = match.end()
+    if sentence := text[start:].strip():
+        yield sentence
+
+
+@dataclass(slots=True)
+class Conversation:
+    sentences: deque = field(default_factory=lambda: deque(maxlen=3))
+    latest_message_id: int = 0
+    handled_message_id: int = 0
+
+    def append(self, message, text):
+        if self.latest_message_id >= message.message_id:
+            return False
+        self.latest_message_id = message.message_id
+        self.sentences.extend((message.message_id, message.date, sentence)
+                              for sentence in split_sentences(text))
+        return True
+
+    def snapshot(self, date):
+        cutoff = date - timedelta(hours=24)
+        previous, new = [], []
+        for message_id, received, sentence in self.sentences:
+            if received > cutoff:
+                target = new if message_id > self.handled_message_id else previous
+                target.append(sentence)
+        return previous, new
 
 
 @dataclass(slots=True)
 class PendingTurn:
-    message: Message | None = None
-    revision: int = 0
+    conversation: Conversation
+    message: Message
     request: Task | None = None
-    latest_message_id: int | None = None
-
-    def append(self, message):
-        if self.latest_message_id is not None and self.latest_message_id >= message.message_id:
-            return
-        self.latest_message_id = message.message_id
-        self.message = message
-        self.revision += 1
-        self.cancel_request()
 
     def cancel_request(self):
         if self.request is not None:
